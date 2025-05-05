@@ -9,7 +9,7 @@ from PIL import Image
 from pdf2image import convert_from_path
 
 # === НАСТРОЙКИ ===
-TOKEN = "7466924390:AAF7g-qFpwhdKUTlWv6nclXgMckHu_uaNUo"
+TOKEN = ""
 TESSERACT_PATH = "/usr/bin/tesseract"
 POPPLER_PATH = "/usr/bin"
 
