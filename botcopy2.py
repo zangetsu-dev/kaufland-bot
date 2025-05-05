@@ -1,106 +1,74 @@
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pdf2image import convert_from_path
 import pytesseract
-import fitz
+import fitz  # PyMuPDF
 import re
 import os
 from tempfile import mkdtemp
-from PIL import Image
-from pdf2image import convert_from_path
 
 # === НАСТРОЙКИ ===
-TOKEN = "7518347474:AAH3Br7RnVrIbqkdCxn3Eq0Gu7BbI_ioH8g"
-TESSERACT_PATH = "/usr/bin/tesseract"
-POPPLER_PATH = "/usr/bin"
-
-pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")  # токен читается из переменной окружения
 bot = telebot.TeleBot(TOKEN)
 
+# === СОСТОЯНИЕ ===
 user_state = {}
 
-def extract_text_from_file(path):
-    if path.lower().endswith(".pdf"):
-        try:
-            # 1. Пробуем как текстовый PDF
-            with fitz.open(path) as doc:
-                text = "".join([page.get_text() for page in doc])
-            if text.strip():
-                return text
-        except:
-            pass
-        # 2. Пробуем как картинку
-        try:
-            images = convert_from_path(path, poppler_path=POPPLER_PATH)
-            return "\n".join([pytesseract.image_to_string(img, lang="deu") for img in images])
-        except:
-            return ""
-    else:
-        try:
-            img = Image.open(path)
-            return pytesseract.image_to_string(img, lang="deu")
-        except:
-            return ""
-
-def parse_products_from_text(text):
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
+# === ИЗВЛЕЧЕНИЕ ТЕКСТА ИЗ PDF ===
+def extract_products_from_pdf(pdf_path):
     try:
-        preis_idx = next(i for i, l in enumerate(lines) if "Preis EUR" in l)
-    except StopIteration:
-        preis_idx = -1
-    try:
-        summe_idx = next(i for i, l in enumerate(lines) if "Zwischensumme" in l)
-    except StopIteration:
-        summe_idx = len(lines)
-
-    names_block = lines[5:preis_idx]
-    prices_block = lines[preis_idx+1:summe_idx]
-
-    price_pattern = re.compile(r"[-+]?\d{1,3}[,.]\d{2}")
-    valid_prices = [p.replace(",", ".") for p in prices_block if price_pattern.fullmatch(p.replace("€", "").strip())]
+        with fitz.open(pdf_path) as doc:
+            extracted_text = "".join([page.get_text() for page in doc])
+        if len(extracted_text.strip()) > 0:
+            print("📄 Извлечён текст напрямую из PDF")
+            full_text = extracted_text
+        else:
+            raise Exception("PDF пустой")
+    except:
+        images = convert_from_path(pdf_path)
+        full_text = ""
+        for img in images:
+            full_text += pytesseract.image_to_string(img, lang="deu")
+        print("🔍 Использован OCR через Tesseract")
 
     products = []
-    for i in range(min(len(names_block), len(valid_prices))):
-        products.append({
-            "name": names_block[i],
-            "price": float(valid_prices[i])
-        })
+    for line in full_text.splitlines():
+        line = line.strip()
+        if not line or any(x in line.lower() for x in ["preis", "summe", "rabatt", "kartenzahlung"]):
+            continue
+        match = re.search(r"(.+?)\s+(\d{1,3},\d{2})\s?([AB])\b", line)
+        if match:
+            name = match.group(1).strip()
+            price = float(match.group(2).replace(",", "."))
+            tax = match.group(3)
+            products.append({"name": name, "price": price, "tax": tax})
 
-    rabatt_match = re.search(r"K\s*Card\s*Rabatt\s*[-–](\d{1,3}[,.]\d{2})", text)
+    rabatt_match = re.search(r"K\s*Card\s*Rabatt\s*[-–](\d{1,3},\d{2})", full_text)
     discount = float(rabatt_match.group(1).replace(",", ".")) if rabatt_match else 0.0
 
     return products, discount
 
+# === /start ===
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    bot.send_message(message.chat.id, "Привет! Отправь PDF или фото чека 🧾 — я помогу поделить.")
+    bot.send_message(message.chat.id, "Привет! Отправь мне PDF-чек из Kaufland 🧾 — я помогу посчитать и поделить покупки.")
 
-@bot.message_handler(content_types=['document', 'photo'])
-def handle_file(message):
+# === ПРИНИМАЕМ PDF ===
+@bot.message_handler(content_types=['document'])
+def handle_docs(message):
+    file_info = bot.get_file(message.document.file_id)
+    downloaded_file = bot.download_file(file_info.file_path)
     temp_dir = mkdtemp()
-    if message.content_type == 'document':
-        file_info = bot.get_file(message.document.file_id)
-        downloaded = bot.download_file(file_info.file_path)
-        file_path = os.path.join(temp_dir, message.document.file_name)
-    elif message.content_type == 'photo':
-        file_info = bot.get_file(message.photo[-1].file_id)
-        downloaded = bot.download_file(file_info.file_path)
-        file_path = os.path.join(temp_dir, "photo.jpg")
-    else:
-        return
+    file_path = os.path.join(temp_dir, message.document.file_name)
 
-    with open(file_path, "wb") as f:
-        f.write(downloaded)
+    with open(file_path, 'wb') as new_file:
+        new_file.write(downloaded_file)
 
-    bot.send_message(message.chat.id, "🔍 Распознаю чек...")
-    text = extract_text_from_file(file_path)
+    bot.send_message(message.chat.id, "🔄 Обрабатываю чек...")
+    products, discount = extract_products_from_pdf(file_path)
 
-    if not text.strip():
-        bot.send_message(message.chat.id, "❌ Не удалось прочитать текст.")
-        return
-
-    products, discount = parse_products_from_text(text)
     if not products:
-        bot.send_message(message.chat.id, "❌ Не удалось найти товары.")
+        bot.send_message(message.chat.id, "❌ Не удалось найти товары в чеке.")
         return
 
     user_state[message.chat.id] = {
@@ -113,9 +81,13 @@ def handle_file(message):
 
     send_next_product(message.chat.id)
 
+# === СЛЕДУЮЩИЙ ТОВАР ===
 def send_next_product(chat_id):
     state = user_state.get(chat_id)
-    if state is None or state["index"] >= len(state["products"]):
+    if state is None:
+        return
+
+    if state["index"] >= len(state["products"]):
         confirmed = state["confirmed"]
         personal = state["personal"]
         discount = state.get("discount", 0)
@@ -125,16 +97,19 @@ def send_next_product(chat_id):
         shared_total = total - personal_total
         brother_owes = round(shared_total / 2, 2)
 
-        msg = f"✅ Готово!\n💰 Сумма: {total:.2f} €"
+        msg = f"✅ Все товары подтверждены!\n\n"
+        msg += f"💰 Общая сумма: {total:.2f} €"
         if discount > 0:
-            msg += f"\n💸 Скидка: -{discount:.2f} €"
-        msg += f"\n🔒 Лично твоё: {personal_total:.2f} €"
+            msg += f"\n💸 Учтена скидка Kaufland Card: -{discount:.2f} €"
+        msg += f"\n🔒 Твои личные товары: {personal_total:.2f} €"
         msg += f"\n🤝 Брат должен тебе: {brother_owes:.2f} €"
+
         bot.send_message(chat_id, msg)
         return
 
     product = state["products"][state["index"]]
-    name, price = product["name"], product["price"]
+    name = product["name"]
+    price = product["price"]
 
     markup = InlineKeyboardMarkup()
     markup.row(
@@ -148,10 +123,14 @@ def send_next_product(chat_id):
 
     bot.send_message(chat_id, f"{name}\nЦена: {price:.2f} €", reply_markup=markup)
 
+# === КНОПКИ ===
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
     chat_id = call.message.chat.id
     state = user_state.get(chat_id)
+    if state is None:
+        return
+
     product = state["products"][state["index"]]
 
     if call.data == "accept":
@@ -160,7 +139,7 @@ def callback_handler(call):
         state["confirmed"].append(product)
         state["personal"].append(product)
     elif call.data == "edit":
-        msg = bot.send_message(chat_id, "✏️ Введи цену:")
+        msg = bot.send_message(chat_id, "✏️ Введи правильную цену:")
         bot.register_next_step_handler(msg, lambda m: handle_price_edit(m, chat_id))
         return
 
@@ -179,4 +158,5 @@ def handle_price_edit(message, chat_id):
     state["index"] += 1
     send_next_product(chat_id)
 
+# === СТАРТ ===
 bot.polling()
