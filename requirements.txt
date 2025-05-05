@@ -1,0 +1,5 @@
+pytelegrambotapi
+pytesseract
+pdf2image
+pymupdf
+pillow
